@@ -1,140 +1,131 @@
-# main.py (Final version with Safety Settings fix)
-
-import requests
+import asyncio
+import hashlib
 import io
 import time
-import pypdf
+import requests
 from fastapi import FastAPI, HTTPException
 
-# --- Import from our new local modules ---
+# --- Intelligent Document Processing ---
+from unstructured.partition.pdf import partition_pdf
+from langchain_core.documents import Document
+
+# --- Import from our local modules ---
 from schemas import HackRxRequest, HackRxResponse
 from config import pc, genai, PINECONE_INDEX_NAME, GEMINI_EMBEDDING_MODEL, GEMINI_GENERATION_MODEL
 
 # --- Third-party Library Imports ---
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-# Import the specific types for safety settings
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="HackRx 6.0 with Gemini Pro",
-    description="An intelligent query system powered by Google Gemini and Pinecone.",
+    title="HackRx 6.0 - High-Accuracy RAG Engine with unstructured.io",
+    description="Uses intelligent parsing for superior accuracy and robust error handling."
 )
 
 # --- Helper Functions ---
-def process_and_chunk_documents(doc_urls: list[str]) -> list[str]:
-    """Downloads, parses, and chunks documents."""
-    all_chunks = []
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    
-    for url in doc_urls:
-        print(f"Downloading and processing: {url}")
-        response = requests.get(url)
-        response.raise_for_status()
-        
-        pdf_file = io.BytesIO(response.content)
-        pdf_reader = pypdf.PdfReader(pdf_file)
-        
-        full_text = "".join(page.extract_text() for page in pdf_reader.pages if page.extract_text())
-        chunks = text_splitter.split_text(full_text)
-        all_chunks.extend(chunks)
-        print(f"Extracted {len(chunks)} chunks from the document.")
-    return all_chunks
 
-def get_answers_from_gemini(questions: list[str], chunks: list[str]) -> list[str]:
-    """Embeds with Gemini, Retrieves from Pinecone, and Generates Answers with Gemini Pro."""
-    
-    if not pc or not genai:
-        raise HTTPException(status_code=500, detail="API clients not initialized. Check config.py and .env file.")
+def create_namespace_from_url(url: str) -> str:
+    """Creates a unique, deterministic, and valid namespace from a URL."""
+    hashed_url = hashlib.sha256(url.encode('utf-8')).hexdigest()
+    return f"doc-{hashed_url[:32]}"
 
-    index = pc.Index(PINECONE_INDEX_NAME)
+async def index_document_if_needed(doc_url: str, namespace: str, index):
+    """Checks if a document is indexed and indexes it if not, using unstructured.io."""
+    stats = index.describe_index_stats()
+    if namespace in stats.namespaces and stats.namespaces[namespace].vector_count > 0:
+        print(f"✅ Document {namespace} already indexed. Skipping indexing.")
+        return
+
+    print(f"🚨 New document detected. Starting one-time indexing for namespace: {namespace}...")
+    start_time = time.time()
     
-    print("Embedding and indexing document chunks with Gemini...")
+    # Step 1 & 2: Partitioning and Chunking with unstructured.io
+    print("   -> Partitioning with unstructured.io for intelligent chunking...")
+    response = requests.get(doc_url)
+    response.raise_for_status()
+    pdf_file = io.BytesIO(response.content)
     
+    # "hi_res" strategy provides the best quality parsing
+    elements = partition_pdf(file=pdf_file, strategy="hi_res")
+    docs = [Document(page_content=str(el), metadata={"source": doc_url, "type": el.category}) for el in elements]
+    print(f"   -> Partitioned into {len(docs)} smart chunks.")
+
+    # Step 3: Embed and Upsert
     batch_size = 100
-    for i in range(0, len(chunks), batch_size):
-        batch_chunks = chunks[i:i+batch_size]
-        response = genai.embed_content(model=GEMINI_EMBEDDING_MODEL, content=batch_chunks, task_type="retrieval_document")
+    for i in range(0, len(docs), batch_size):
+        batch_docs = docs[i:i+batch_size]
+        batch_content = [doc.page_content for doc in batch_docs]
+        response = genai.embed_content(model=GEMINI_EMBEDDING_MODEL, content=batch_content, task_type="retrieval_document")
         embeddings = response['embedding']
-        
-        ids = [f"chunk_{j}" for j in range(i, i + len(batch_chunks))]
-        metadata = [{"text": chunk} for chunk in batch_chunks]
-        
-        index.upsert(vectors=zip(ids, embeddings, metadata))
-        print(f"Upserted batch {i//batch_size + 1}")
-        time.sleep(1)
+        ids = [f"chunk_{i+j}" for j in range(len(batch_docs))]
+        metadata = [{"text": doc.page_content} for doc in batch_docs]
+        index.upsert(vectors=zip(ids, embeddings, metadata), namespace=namespace)
+        print(f"   -> Upserted batch {i//batch_size + 1} into {namespace}")
 
-    print("Indexing complete.")
+    end_time = time.time()
+    print(f"✅ Indexing complete for {namespace}. Time taken: {end_time - start_time:.2f} seconds.")
 
-    final_answers = []
+
+async def get_single_answer(question: str, namespace: str, generation_model, safety_settings) -> str:
+    """Processes a single question with robust error handling."""
+    try:
+        index = pc.Index(PINECONE_INDEX_NAME)
+        query_embedding = genai.embed_content(model=GEMINI_EMBEDDING_MODEL, content=question, task_type="retrieval_query")['embedding']
+        
+        query_results = index.query(vector=query_embedding, top_k=5, include_metadata=True, namespace=namespace)
+        context = "\n\n---\n\n".join([match['metadata']['text'] for match in query_results['matches']])
+        
+        prompt = f"""You are a helpful assistant for an insurance policy. Based ONLY on the following CONTEXT, answer the user's QUESTION.
+
+- Answer concisely in 2-3 sentences.
+- Focus on the most important conditions, numbers, and limits.
+- If the answer is not in the context, state 'The answer could not be found in the provided document.'
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+ANSWER:"""
+        
+        response = generation_model.generate_content(prompt, safety_settings=safety_settings)
+
+        if response.parts:
+            return response.text.strip()
+        elif response.prompt_feedback.block_reason:
+            reason = response.prompt_feedback.block_reason.name
+            print(f"Response blocked for question '{question}'. Reason: {reason}")
+            return f"The response was blocked by the safety filter due to: {reason}"
+        else:
+            return "Received an empty response from the model."
+
+    except Exception as e:
+        print(f"An unexpected error occurred for question '{question}': {e}")
+        return f"An unexpected error occurred: {e}"
+
+# --- API Endpoint ---
+@app.post("/hackrx/run", response_model=HackRxResponse)
+async def run_submission(request: HackRxRequest):
+    doc_url = request.documents[0] if isinstance(request.documents, list) else request.documents
+    namespace = create_namespace_from_url(doc_url)
+    index = pc.Index(PINECONE_INDEX_NAME)
+
+    await index_document_if_needed(doc_url, namespace, index)
+
     generation_model = genai.GenerativeModel(GEMINI_GENERATION_MODEL)
-    
-    # --- FIX: Define safety settings to be more lenient ---
-    # This prevents the model from blocking responses due to sensitive (but safe) topics like medical procedures.
     safety_settings = {
         HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
     }
+
+    tasks = [get_single_answer(q, namespace, generation_model, safety_settings) for q in request.questions]
+    final_answers = await asyncio.gather(*tasks)
     
-    for q in questions:
-        print(f"Processing question: {q}")
-        query_embedding = genai.embed_content(model=GEMINI_EMBEDDING_MODEL, content=q, task_type="retrieval_query")['embedding']
-        
-        query_results = index.query(vector=query_embedding, top_k=5, include_metadata=True)
-        context = "\n\n---\n\n".join([match['metadata']['text'] for match in query_results['matches']])
-        
-        prompt = f"""Based ONLY on the following context, answer the user's question. If the answer is not present in the context, state 'The answer could not be found in the provided document.' Do not use any external knowledge.
+    return HackRxResponse(answers=final_answers)
 
-CONTEXT:
-{context}
-
-QUESTION:
-{q}
-
-ANSWER:"""
-        
-        # Pass the safety_settings to the generation call
-        response = generation_model.generate_content(prompt, safety_settings=safety_settings)
-        
-        # --- FIX: Add a try-except block for robustness ---
-        try:
-            answer = response.text.strip()
-        except ValueError:
-            # This will catch the error if the response is blocked despite our settings.
-            answer = "The response was blocked by content safety filters."
-            print(f"Response blocked for question: '{q}'. Safety ratings: {response.prompt_feedback}")
-            
-        final_answers.append(answer)
-        print(f"Generated answer: {answer[:80]}...")
-        
-    return final_answers
-
-# --- API Endpoint ---
-@app.post("/hackrx/run", response_model=HackRxResponse)
-async def run_submission(request: HackRxRequest):
-    try:
-        if isinstance(request.documents, str):
-            doc_urls = [request.documents]
-        else:
-            doc_urls = request.documents
-
-        all_chunks = process_and_chunk_documents(doc_urls)
-        
-        if not all_chunks:
-            raise HTTPException(status_code=400, detail="Could not extract any text from the documents.")
-
-        final_answers = get_answers_from_gemini(request.questions, all_chunks)
-        
-        return HackRxResponse(answers=final_answers)
-
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
-
-# --- Main execution block ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

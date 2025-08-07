@@ -1,9 +1,7 @@
 fastapi==0.111.0
 uvicorn==0.30.1
-watchfiles==0.23.0
 requests==2.32.3
-python-dotenv==1.0.1
-google-generativeai==0.7.1
 pinecone-client==4.1.2
-pypdf==4.2.0         
-langchain==0.2.5
+google-generativeai==0.7.2
+langchain-core==0.2.22
+unstructured[pdf]
