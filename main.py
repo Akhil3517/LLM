@@ -16,6 +16,14 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 app = FastAPI(title="HackRx 6.0 - Fast & Corrected RAG Engine")
 
+@app.get("/")
+async def root():
+    return {"message": "Policy RAG Webhook is running!", "status": "healthy"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "policy-rag-webhook"}
+
 def create_namespace_from_url(url: str) -> str:
     hashed_url = hashlib.sha256(url.encode('utf-8')).hexdigest()
     return f"doc-{hashed_url[:32]}"
