@@ -4,6 +4,6 @@ requests==2.32.3
 pinecone-client==4.1.2
 google-generativeai==0.7.2
 langchain-core==0.2.22
-unstructured==0.18.11
-unstructured[pdf]
 python-dotenv==1.0.0
+# Using lighter PDF processing
+pypdf2==3.0.1

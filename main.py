@@ -4,7 +4,7 @@ import io
 import requests
 from fastapi import FastAPI, HTTPException
 
-from unstructured.partition.pdf import partition_pdf
+import PyPDF2
 from langchain_core.documents import Document
 
 # Local Modules
@@ -29,15 +29,28 @@ async def index_document_if_needed(doc_url: str, namespace: str, index):
     print(f"🚨 New document detected. Indexing namespace: {namespace}...")
     response = requests.get(doc_url)
     response.raise_for_status()
-    elements = partition_pdf(file=io.BytesIO(response.content), strategy="hi_res")
-    docs = [Document(page_content=str(el), metadata={"source": doc_url}) for el in elements]
+    
+    # Use PyPDF2 for lighter PDF processing
+    pdf_file = io.BytesIO(response.content)
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    
+    docs = []
+    for page_num in range(len(pdf_reader.pages)):
+        page = pdf_reader.pages[page_num]
+        text = page.extract_text()
+        if text.strip():  # Only add non-empty pages
+            docs.append(Document(page_content=text, metadata={"source": doc_url, "page": page_num + 1}))
 
-    batch_size = 100
+    batch_size = 50  # Reduced batch size for memory optimization
     for i in range(0, len(docs), batch_size):
         batch_docs = docs[i:i+batch_size]
-        response = genai.embed_content(model=GEMINI_EMBEDDING_MODEL, content=[d.page_content for d in batch_docs], task_type="retrieval_document")
-        index.upsert(vectors=zip([f"chunk_{i+j}" for j in range(len(batch_docs))], response['embedding'], [{"text": d.page_content} for d in batch_docs]), namespace=namespace)
-        print(f"   -> Upserted batch {i//batch_size + 1} into {namespace}")
+        try:
+            response = genai.embed_content(model=GEMINI_EMBEDDING_MODEL, content=[d.page_content for d in batch_docs], task_type="retrieval_document")
+            index.upsert(vectors=zip([f"chunk_{i+j}" for j in range(len(batch_docs))], response['embedding'], [{"text": d.page_content} for d in batch_docs]), namespace=namespace)
+            print(f"   -> Upserted batch {i//batch_size + 1} into {namespace}")
+        except Exception as e:
+            print(f"   -> Error in batch {i//batch_size + 1}: {e}")
+            continue
 
 async def expand_query(question: str, generation_model):
     prompt = f"Rewrite the following user question to be more detailed for searching an insurance policy. Question: {question}"
